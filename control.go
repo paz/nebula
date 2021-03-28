@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/sirupsen/logrus"
@@ -22,11 +23,11 @@ type ControlHostInfo struct {
 	VpnIP          net.IP                  `json:"vpnIp"`
 	LocalIndex     uint32                  `json:"localIndex"`
 	RemoteIndex    uint32                  `json:"remoteIndex"`
-	RemoteAddrs    []udpAddr               `json:"remoteAddrs"`
+	RemoteAddrs    []*udpAddr              `json:"remoteAddrs"`
 	CachedPackets  int                     `json:"cachedPackets"`
 	Cert           *cert.NebulaCertificate `json:"cert"`
 	MessageCounter uint64                  `json:"messageCounter"`
-	CurrentRemote  udpAddr                 `json:"currentRemote"`
+	CurrentRemote  *udpAddr                `json:"currentRemote"`
 }
 
 // Start actually runs nebula, this is a nonblocking call. To block use Control.ShutdownBlock()
@@ -37,19 +38,7 @@ func (c *Control) Start() {
 // Stop signals nebula to shutdown, returns after the shutdown is complete
 func (c *Control) Stop() {
 	//TODO: stop tun and udp routines, the lock on hostMap effectively does that though
-	//TODO: this is probably better as a function in ConnectionManager or HostMap directly
-	c.f.hostMap.Lock()
-	for _, h := range c.f.hostMap.Hosts {
-		if h.ConnectionState.ready {
-			c.f.send(closeTunnel, 0, h.ConnectionState, h, h.remote, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
-			c.l.WithField("vpnIp", IntIp(h.hostId)).WithField("udpAddr", h.remote).
-				Debug("Sending close tunnel message")
-		}
-	}
-	c.f.hostMap.Unlock()
-	if err := c.f.Close(); err != nil {
-		c.l.WithError(err).Error("Close interface failed")
-	}
+	c.CloseAllTunnels(false)
 	c.l.Info("Goodbye")
 }
 
@@ -68,6 +57,12 @@ func (c *Control) ShutdownBlock() {
 // RebindUDPServer asks the UDP listener to rebind it's listener. Mainly used on mobile clients when interfaces change
 func (c *Control) RebindUDPServer() {
 	_ = c.f.outside.Rebind()
+
+	// Trigger a lighthouse update, useful for mobile clients that should have an update interval of 0
+	c.f.lightHouse.SendUpdate(c.f)
+
+	// Let the main interface know that we rebound so that underlying tunnels know to trigger punches from their remotes
+	c.f.rebindCount++
 }
 
 // ListHostmap returns details about the actual or pending (handshaking) hostmap
@@ -145,15 +140,38 @@ func (c *Control) CloseTunnel(vpnIP uint32, localOnly bool) bool {
 	return true
 }
 
+// CloseAllTunnels is just like CloseTunnel except it goes through and shuts them all down, optionally you can avoid shutting down lighthouse tunnels
+// the int returned is a count of tunnels closed
+func (c *Control) CloseAllTunnels(excludeLighthouses bool) (closed int) {
+	//TODO: this is probably better as a function in ConnectionManager or HostMap directly
+	c.f.hostMap.Lock()
+	for _, h := range c.f.hostMap.Hosts {
+		if excludeLighthouses {
+			if _, ok := c.f.lightHouse.lighthouses[h.hostId]; ok {
+				continue
+			}
+		}
+
+		if h.ConnectionState.ready {
+			c.f.send(closeTunnel, 0, h.ConnectionState, h, h.remote, []byte{}, make([]byte, 12, 12), make([]byte, mtu))
+			c.l.WithField("vpnIp", IntIp(h.hostId)).WithField("udpAddr", h.remote).
+				Debug("Sending close tunnel message")
+			closed++
+		}
+	}
+	c.f.hostMap.Unlock()
+	return
+}
+
 func copyHostInfo(h *HostInfo) ControlHostInfo {
 	addrs := h.RemoteUDPAddrs()
 	chi := ControlHostInfo{
 		VpnIP:          int2ip(h.hostId),
 		LocalIndex:     h.localIndexId,
 		RemoteIndex:    h.remoteIndexId,
-		RemoteAddrs:    make([]udpAddr, len(addrs), len(addrs)),
+		RemoteAddrs:    make([]*udpAddr, len(addrs), len(addrs)),
 		CachedPackets:  len(h.packetStore),
-		MessageCounter: *h.ConnectionState.messageCounter,
+		MessageCounter: atomic.LoadUint64(&h.ConnectionState.atomicMessageCounter),
 	}
 
 	if c := h.GetCert(); c != nil {
@@ -161,7 +179,7 @@ func copyHostInfo(h *HostInfo) ControlHostInfo {
 	}
 
 	if h.remote != nil {
-		chi.CurrentRemote = *h.remote
+		chi.CurrentRemote = h.remote.Copy()
 	}
 
 	for i, addr := range addrs {

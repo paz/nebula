@@ -1,6 +1,6 @@
 module github.com/slackhq/nebula
 
-go 1.12
+go 1.16
 
 require (
 	github.com/anmitsu/go-shlex v0.0.0-20161002113705-648efa622239
@@ -9,7 +9,7 @@ require (
 	github.com/cyberdelia/go-metrics-graphite v0.0.0-20161219230853-39f87cc3b432
 	github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568 // indirect
 	github.com/flynn/noise v0.0.0-20180327030543-2492fe189ae6
-	github.com/golang/protobuf v1.3.2
+	github.com/golang/protobuf v1.5.0
 	github.com/imdario/mergo v0.3.8
 	github.com/kardianos/service v1.1.0
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
@@ -21,6 +21,7 @@ require (
 	github.com/prometheus/procfs v0.0.8 // indirect
 	github.com/rcrowley/go-metrics v0.0.0-20190826022208-cac0b30c2563
 	github.com/sirupsen/logrus v1.4.2
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/songgao/water v0.0.0-20190725173103-fd331bda3f4b
 	github.com/stretchr/testify v1.6.1
 	github.com/vishvananda/netlink v1.0.1-0.20190522153524-00009fb8606a
@@ -30,6 +31,11 @@ require (
 	golang.org/x/sys v0.0.0-20210124154548-22da62e12c0c
 	golang.zx2c4.com/wireguard v0.0.20201119-0.20201209004655-310ae107c346
 	golang.zx2c4.com/wireguard/windows v0.3.4
+	golang.org/x/crypto v0.0.0-20200220183623-bac4c82f6975
+	golang.org/x/net v0.0.0-20191209160850-c0dbc17a3553
+	golang.org/x/sys v0.0.0-20191210023423-ac6580df4449
+	google.golang.org/genproto v0.0.0-20200526211855-cb27e3aa2013 // indirect
+	google.golang.org/protobuf v1.26.0
 	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
 	gopkg.in/yaml.v2 v2.2.7
 )

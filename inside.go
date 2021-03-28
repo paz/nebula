@@ -7,10 +7,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func (f *Interface) consumeInsidePacket(packet []byte, fwPacket *FirewallPacket, nb, out []byte) {
+func (f *Interface) consumeInsidePacket(packet []byte, fwPacket *FirewallPacket, nb, out []byte, q int, localCache ConntrackCache) {
 	err := newPacket(packet, false, fwPacket)
 	if err != nil {
-		l.WithField("packet", packet).Debugf("Error while validating outbound packet: %s", err)
+		f.l.WithField("packet", packet).Debugf("Error while validating outbound packet: %s", err)
 		return
 	}
 
@@ -31,8 +31,8 @@ func (f *Interface) consumeInsidePacket(packet []byte, fwPacket *FirewallPacket,
 
 	hostinfo := f.getOrHandshake(fwPacket.RemoteIP)
 	if hostinfo == nil {
-		if l.Level >= logrus.DebugLevel {
-			l.WithField("vpnIp", IntIp(fwPacket.RemoteIP)).
+		if f.l.Level >= logrus.DebugLevel {
+			f.l.WithField("vpnIp", IntIp(fwPacket.RemoteIP)).
 				WithField("fwPacket", fwPacket).
 				Debugln("dropping outbound packet, vpnIp not in our CIDR or in unsafe routes")
 		}
@@ -45,22 +45,22 @@ func (f *Interface) consumeInsidePacket(packet []byte, fwPacket *FirewallPacket,
 		// the packet queue.
 		ci.queueLock.Lock()
 		if !ci.ready {
-			hostinfo.cachePacket(message, 0, packet, f.sendMessageNow)
+			hostinfo.cachePacket(f.l, message, 0, packet, f.sendMessageNow)
 			ci.queueLock.Unlock()
 			return
 		}
 		ci.queueLock.Unlock()
 	}
 
-	dropReason := f.firewall.Drop(packet, *fwPacket, false, hostinfo, trustedCAs)
+	dropReason := f.firewall.Drop(packet, *fwPacket, false, hostinfo, trustedCAs, localCache)
 	if dropReason == nil {
-		mc := f.sendNoMetrics(message, 0, ci, hostinfo, hostinfo.remote, packet, nb, out)
+		mc := f.sendNoMetrics(message, 0, ci, hostinfo, hostinfo.remote, packet, nb, out, q)
 		if f.lightHouse != nil && mc%5000 == 0 {
 			f.lightHouse.Query(fwPacket.RemoteIP, f)
 		}
 
-	} else if l.Level >= logrus.DebugLevel {
-		hostinfo.logger().
+	} else if f.l.Level >= logrus.DebugLevel {
+		hostinfo.logger(f.l).
 			WithField("fwPacket", fwPacket).
 			WithField("reason", dropReason).
 			Debugln("dropping outbound packet")
@@ -91,9 +91,20 @@ func (f *Interface) getOrHandshake(vpnIp uint32) *HostInfo {
 		return hostinfo
 	}
 
+	// Handshake is not ready, we need to grab the lock now before we start
+	// the handshake process
+	hostinfo.Lock()
+	defer hostinfo.Unlock()
+
+	// Double check, now that we have the lock
+	ci = hostinfo.ConnectionState
+	if ci != nil && ci.eKey != nil && ci.ready {
+		return hostinfo
+	}
+
 	if ci == nil {
 		// if we don't have a connection state, then send a handshake initiation
-		ci = f.newConnectionState(true, noise.HandshakeIX, []byte{}, 0)
+		ci = f.newConnectionState(f.l, true, noise.HandshakeIX, []byte{}, 0)
 		// FIXME: Maybe make XX selectable, but probably not since psk makes it nearly pointless for us.
 		//ci = f.newConnectionState(true, noise.HandshakeXX, []byte{}, 0)
 		hostinfo.ConnectionState = ci
@@ -124,23 +135,23 @@ func (f *Interface) sendMessageNow(t NebulaMessageType, st NebulaMessageSubType,
 	fp := &FirewallPacket{}
 	err := newPacket(p, false, fp)
 	if err != nil {
-		l.Warnf("error while parsing outgoing packet for firewall check; %v", err)
+		f.l.Warnf("error while parsing outgoing packet for firewall check; %v", err)
 		return
 	}
 
 	// check if packet is in outbound fw rules
-	dropReason := f.firewall.Drop(p, *fp, false, hostInfo, trustedCAs)
+	dropReason := f.firewall.Drop(p, *fp, false, hostInfo, trustedCAs, nil)
 	if dropReason != nil {
-		if l.Level >= logrus.DebugLevel {
-			l.WithField("fwPacket", fp).
+		if f.l.Level >= logrus.DebugLevel {
+			f.l.WithField("fwPacket", fp).
 				WithField("reason", dropReason).
 				Debugln("dropping cached packet")
 		}
 		return
 	}
 
-	f.sendNoMetrics(message, st, hostInfo.ConnectionState, hostInfo, hostInfo.remote, p, nb, out)
-	if f.lightHouse != nil && *hostInfo.ConnectionState.messageCounter%5000 == 0 {
+	messageCounter := f.sendNoMetrics(message, st, hostInfo.ConnectionState, hostInfo, hostInfo.remote, p, nb, out, 0)
+	if f.lightHouse != nil && messageCounter%5000 == 0 {
 		f.lightHouse.Query(fp.RemoteIP, f)
 	}
 }
@@ -149,8 +160,8 @@ func (f *Interface) sendMessageNow(t NebulaMessageType, st NebulaMessageSubType,
 func (f *Interface) SendMessageToVpnIp(t NebulaMessageType, st NebulaMessageSubType, vpnIp uint32, p, nb, out []byte) {
 	hostInfo := f.getOrHandshake(vpnIp)
 	if hostInfo == nil {
-		if l.Level >= logrus.DebugLevel {
-			l.WithField("vpnIp", IntIp(vpnIp)).
+		if f.l.Level >= logrus.DebugLevel {
+			f.l.WithField("vpnIp", IntIp(vpnIp)).
 				Debugln("dropping SendMessageToVpnIp, vpnIp not in our CIDR or in unsafe routes")
 		}
 		return
@@ -161,7 +172,7 @@ func (f *Interface) SendMessageToVpnIp(t NebulaMessageType, st NebulaMessageSubT
 		// the packet queue.
 		hostInfo.ConnectionState.queueLock.Lock()
 		if !hostInfo.ConnectionState.ready {
-			hostInfo.cachePacket(t, st, p, f.sendMessageToVpnIp)
+			hostInfo.cachePacket(f.l, t, st, p, f.sendMessageToVpnIp)
 			hostInfo.ConnectionState.queueLock.Unlock()
 			return
 		}
@@ -180,8 +191,8 @@ func (f *Interface) sendMessageToVpnIp(t NebulaMessageType, st NebulaMessageSubT
 func (f *Interface) SendMessageToAll(t NebulaMessageType, st NebulaMessageSubType, vpnIp uint32, p, nb, out []byte) {
 	hostInfo := f.getOrHandshake(vpnIp)
 	if hostInfo == nil {
-		if l.Level >= logrus.DebugLevel {
-			l.WithField("vpnIp", IntIp(vpnIp)).
+		if f.l.Level >= logrus.DebugLevel {
+			f.l.WithField("vpnIp", IntIp(vpnIp)).
 				Debugln("dropping SendMessageToAll, vpnIp not in our CIDR or in unsafe routes")
 		}
 		return
@@ -192,7 +203,7 @@ func (f *Interface) SendMessageToAll(t NebulaMessageType, st NebulaMessageSubTyp
 		// the packet queue.
 		hostInfo.ConnectionState.queueLock.Lock()
 		if !hostInfo.ConnectionState.ready {
-			hostInfo.cachePacket(t, st, p, f.sendMessageToAll)
+			hostInfo.cachePacket(f.l, t, st, p, f.sendMessageToAll)
 			hostInfo.ConnectionState.queueLock.Unlock()
 			return
 		}
@@ -211,10 +222,10 @@ func (f *Interface) sendMessageToAll(t NebulaMessageType, st NebulaMessageSubTyp
 
 func (f *Interface) send(t NebulaMessageType, st NebulaMessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote *udpAddr, p, nb, out []byte) {
 	f.messageMetrics.Tx(t, st, 1)
-	f.sendNoMetrics(t, st, ci, hostinfo, remote, p, nb, out)
+	f.sendNoMetrics(t, st, ci, hostinfo, remote, p, nb, out, 0)
 }
 
-func (f *Interface) sendNoMetrics(t NebulaMessageType, st NebulaMessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote *udpAddr, p, nb, out []byte) uint64 {
+func (f *Interface) sendNoMetrics(t NebulaMessageType, st NebulaMessageSubType, ci *ConnectionState, hostinfo *HostInfo, remote *udpAddr, p, nb, out []byte, q int) uint64 {
 	if ci.eKey == nil {
 		//TODO: log warning
 		return 0
@@ -223,26 +234,38 @@ func (f *Interface) sendNoMetrics(t NebulaMessageType, st NebulaMessageSubType, 
 	var err error
 	//TODO: enable if we do more than 1 tun queue
 	//ci.writeLock.Lock()
-	c := atomic.AddUint64(ci.messageCounter, 1)
+	c := atomic.AddUint64(&ci.atomicMessageCounter, 1)
 
 	//l.WithField("trace", string(debug.Stack())).Error("out Header ", &Header{Version, t, st, 0, hostinfo.remoteIndexId, c}, p)
 	out = HeaderEncode(out, Version, uint8(t), uint8(st), hostinfo.remoteIndexId, c)
 	f.connectionManager.Out(hostinfo.hostId)
 
+	// Query our LH if we haven't since the last time we've been rebound, this will cause the remote to punch against
+	// all our IPs and enable a faster roaming.
+	if hostinfo.lastRebindCount != f.rebindCount {
+		//NOTE: there is an update hole if a tunnel isn't used and exactly 256 rebinds occur before the tunnel is
+		// finally used again. This tunnel would eventually be torn down and recreated if this action didn't help.
+		f.lightHouse.Query(hostinfo.hostId, f)
+		hostinfo.lastRebindCount = f.rebindCount
+		if f.l.Level >= logrus.DebugLevel {
+			f.l.WithField("vpnIp", hostinfo.hostId).Debug("Lighthouse update triggered for punch due to rebind counter")
+		}
+	}
+
 	out, err = ci.eKey.EncryptDanger(out, out, p, c, nb)
 	//TODO: see above note on lock
 	//ci.writeLock.Unlock()
 	if err != nil {
-		hostinfo.logger().WithError(err).
+		hostinfo.logger(f.l).WithError(err).
 			WithField("udpAddr", remote).WithField("counter", c).
-			WithField("attemptedCounter", ci.messageCounter).
+			WithField("attemptedCounter", c).
 			Error("Failed to encrypt outgoing packet")
 		return c
 	}
 
-	err = f.outside.WriteTo(out, remote)
+	err = f.writers[q].WriteTo(out, remote)
 	if err != nil {
-		hostinfo.logger().WithError(err).
+		hostinfo.logger(f.l).WithError(err).
 			WithField("udpAddr", remote).Error("Failed to write outgoing packet")
 	}
 	return c

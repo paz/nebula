@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -19,7 +20,7 @@ const MaxRemotes = 10
 
 // How long we should prevent roaming back to the previous IP.
 // This helps prevent flapping due to packets already in flight
-const RoamingSupressSeconds = 2
+const RoamingSuppressSeconds = 2
 
 type HostMap struct {
 	sync.RWMutex    //Because we concurrently read and write to our maps
@@ -32,9 +33,12 @@ type HostMap struct {
 	defaultRoute    uint32
 	unsafeRoutes    *CIDRTree
 	metricsEnabled  bool
+	l               *logrus.Logger
 }
 
 type HostInfo struct {
+	sync.RWMutex
+
 	remote            *udpAddr
 	Remotes           []*HostInfoDest
 	promoteCounter    uint32
@@ -50,6 +54,11 @@ type HostInfo struct {
 	hostId            uint32
 	recvError         int
 	remoteCidr        *CIDRTree
+
+	// lastRebindCount is the other side of Interface.rebindCount, if these values don't match then we need to ask LH
+	// for a punch from the remote end of this tunnel. The goal being to prime their conntrack for our traffic just like
+	// with a handshake
+	lastRebindCount int8
 
 	lastRoam       time.Time
 	lastRoamRemote *udpAddr
@@ -75,7 +84,7 @@ type Probe struct {
 	Counter int
 }
 
-func NewHostMap(name string, vpnCIDR *net.IPNet, preferredRanges []*net.IPNet) *HostMap {
+func NewHostMap(l *logrus.Logger, name string, vpnCIDR *net.IPNet, preferredRanges []*net.IPNet) *HostMap {
 	h := map[uint32]*HostInfo{}
 	i := map[uint32]*HostInfo{}
 	r := map[uint32]*HostInfo{}
@@ -88,6 +97,7 @@ func NewHostMap(name string, vpnCIDR *net.IPNet, preferredRanges []*net.IPNet) *
 		vpnCIDR:         vpnCIDR,
 		defaultRoute:    0,
 		unsafeRoutes:    NewCIDRTree(),
+		l:               l,
 	}
 	return &m
 }
@@ -152,43 +162,9 @@ func (hm *HostMap) DeleteVpnIP(vpnIP uint32) {
 	}
 	hm.Unlock()
 
-	if l.Level >= logrus.DebugLevel {
-		l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(vpnIP), "mapTotalSize": len(hm.Hosts)}).
+	if hm.l.Level >= logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(vpnIP), "mapTotalSize": len(hm.Hosts)}).
 			Debug("Hostmap vpnIp deleted")
-	}
-}
-
-func (hm *HostMap) AddIndex(index uint32, ci *ConnectionState) (*HostInfo, error) {
-	hm.Lock()
-	if _, ok := hm.Indexes[index]; !ok {
-		h := &HostInfo{
-			ConnectionState: ci,
-			Remotes:         []*HostInfoDest{},
-			localIndexId:    index,
-			HandshakePacket: make(map[uint8][]byte, 0),
-		}
-		hm.Indexes[index] = h
-		l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes),
-			"hostinfo": m{"existing": false, "localIndexId": h.localIndexId, "hostId": IntIp(h.hostId)}}).
-			Debug("Hostmap index added")
-
-		hm.Unlock()
-		return h, nil
-	}
-	hm.Unlock()
-	return nil, fmt.Errorf("refusing to overwrite existing index: %d", index)
-}
-
-func (hm *HostMap) AddIndexHostInfo(index uint32, h *HostInfo) {
-	hm.Lock()
-	h.localIndexId = index
-	hm.Indexes[index] = h
-	hm.Unlock()
-
-	if l.Level > logrus.DebugLevel {
-		l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes),
-			"hostinfo": m{"existing": true, "localIndexId": h.localIndexId, "hostId": IntIp(h.hostId)}}).
-			Debug("Hostmap index added")
 	}
 }
 
@@ -199,8 +175,8 @@ func (hm *HostMap) addRemoteIndexHostInfo(index uint32, h *HostInfo) {
 	hm.RemoteIndexes[index] = h
 	hm.Unlock()
 
-	if l.Level > logrus.DebugLevel {
-		l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes),
+	if hm.l.Level > logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes),
 			"hostinfo": m{"existing": true, "localIndexId": h.localIndexId, "hostId": IntIp(h.hostId)}}).
 			Debug("Hostmap remoteIndex added")
 	}
@@ -214,29 +190,73 @@ func (hm *HostMap) AddVpnIPHostInfo(vpnIP uint32, h *HostInfo) {
 	hm.RemoteIndexes[h.remoteIndexId] = h
 	hm.Unlock()
 
-	if l.Level > logrus.DebugLevel {
-		l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(vpnIP), "mapTotalSize": len(hm.Hosts),
+	if hm.l.Level > logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(vpnIP), "mapTotalSize": len(hm.Hosts),
 			"hostinfo": m{"existing": true, "localIndexId": h.localIndexId, "hostId": IntIp(h.hostId)}}).
 			Debug("Hostmap vpnIp added")
 	}
 }
 
+// This is only called in pendingHostmap, to cleanup an inbound handshake
 func (hm *HostMap) DeleteIndex(index uint32) {
 	hm.Lock()
-	delete(hm.Indexes, index)
-	if len(hm.Indexes) == 0 {
-		hm.Indexes = map[uint32]*HostInfo{}
+	hostinfo, ok := hm.Indexes[index]
+	if ok {
+		delete(hm.Indexes, index)
+		delete(hm.RemoteIndexes, hostinfo.remoteIndexId)
+
+		// Check if we have an entry under hostId that matches the same hostinfo
+		// instance. Clean it up as well if we do.
+		hostinfo2, ok := hm.Hosts[hostinfo.hostId]
+		if ok && hostinfo2 == hostinfo {
+			delete(hm.Hosts, hostinfo.hostId)
+		}
 	}
 	hm.Unlock()
 
-	if l.Level >= logrus.DebugLevel {
-		l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes)}).
+	if hm.l.Level >= logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes)}).
 			Debug("Hostmap index deleted")
+	}
+}
+
+// This is used to cleanup on recv_error
+func (hm *HostMap) DeleteReverseIndex(index uint32) {
+	hm.Lock()
+	hostinfo, ok := hm.RemoteIndexes[index]
+	if ok {
+		delete(hm.Indexes, hostinfo.localIndexId)
+		delete(hm.RemoteIndexes, index)
+
+		// Check if we have an entry under hostId that matches the same hostinfo
+		// instance. Clean it up as well if we do (they might not match in pendingHostmap)
+		var hostinfo2 *HostInfo
+		hostinfo2, ok = hm.Hosts[hostinfo.hostId]
+		if ok && hostinfo2 == hostinfo {
+			delete(hm.Hosts, hostinfo.hostId)
+		}
+	}
+	hm.Unlock()
+
+	if hm.l.Level >= logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "indexNumber": index, "mapTotalSize": len(hm.Indexes)}).
+			Debug("Hostmap remote index deleted")
 	}
 }
 
 func (hm *HostMap) DeleteHostInfo(hostinfo *HostInfo) {
 	hm.Lock()
+
+	// Check if this same hostId is in the hostmap with a different instance.
+	// This could happen if we have an entry in the pending hostmap with different
+	// index values than the one in the main hostmap.
+	hostinfo2, ok := hm.Hosts[hostinfo.hostId]
+	if ok && hostinfo2 != hostinfo {
+		delete(hm.Hosts, hostinfo2.hostId)
+		delete(hm.Indexes, hostinfo2.localIndexId)
+		delete(hm.RemoteIndexes, hostinfo2.remoteIndexId)
+	}
+
 	delete(hm.Hosts, hostinfo.hostId)
 	if len(hm.Hosts) == 0 {
 		hm.Hosts = map[uint32]*HostInfo{}
@@ -251,8 +271,8 @@ func (hm *HostMap) DeleteHostInfo(hostinfo *HostInfo) {
 	}
 	hm.Unlock()
 
-	if l.Level >= logrus.DebugLevel {
-		l.WithField("hostMap", m{"mapName": hm.name, "mapTotalSize": len(hm.Hosts),
+	if hm.l.Level >= logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "mapTotalSize": len(hm.Hosts),
 			"vpnIp": IntIp(hostinfo.hostId), "indexNumber": hostinfo.localIndexId, "remoteIndexNumber": hostinfo.remoteIndexId}).
 			Debug("Hostmap hostInfo deleted")
 	}
@@ -285,7 +305,7 @@ func (hm *HostMap) AddRemote(vpnIp uint32, remote *udpAddr) *HostInfo {
 	hm.Lock()
 	i, v := hm.Hosts[vpnIp]
 	if v {
-		i.AddRemote(*remote)
+		i.AddRemote(remote)
 	} else {
 		i = &HostInfo{
 			Remotes:         []*HostInfoDest{NewHostInfoDest(remote)},
@@ -295,8 +315,10 @@ func (hm *HostMap) AddRemote(vpnIp uint32, remote *udpAddr) *HostInfo {
 		}
 		i.remote = i.Remotes[0].addr
 		hm.Hosts[vpnIp] = i
-		l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(vpnIp), "udpAddr": remote, "mapTotalSize": len(hm.Hosts)}).
-			Debug("Hostmap remote ip added")
+		if hm.l.Level >= logrus.DebugLevel {
+			hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(vpnIp), "udpAddr": remote, "mapTotalSize": len(hm.Hosts)}).
+				Debug("Hostmap remote ip added")
+		}
 	}
 	i.ForcePromoteBest(hm.preferredRanges)
 	hm.Unlock()
@@ -344,36 +366,26 @@ func (hm *HostMap) queryUnsafeRoute(ip uint32) uint32 {
 	}
 }
 
-func (hm *HostMap) CheckHandshakeCompleteIP(vpnIP uint32) bool {
-	hm.RLock()
-	if i, ok := hm.Hosts[vpnIP]; ok {
-		if i == nil {
-			hm.RUnlock()
-			return false
-		}
-		complete := i.HandshakeComplete
-		hm.RUnlock()
-		return complete
+// We already have the hm Lock when this is called, so make sure to not call
+// any other methods that might try to grab it again
+func (hm *HostMap) addHostInfo(hostinfo *HostInfo, f *Interface) {
+	remoteCert := hostinfo.ConnectionState.peerCert
+	ip := ip2int(remoteCert.Details.Ips[0].IP)
 
+	f.lightHouse.AddRemoteAndReset(ip, hostinfo.remote)
+	if f.serveDns {
+		dnsR.Add(remoteCert.Details.Name+".", remoteCert.Details.Ips[0].IP.String())
 	}
-	hm.RUnlock()
-	return false
-}
 
-func (hm *HostMap) CheckHandshakeCompleteIndex(index uint32) bool {
-	hm.RLock()
-	if i, ok := hm.Indexes[index]; ok {
-		if i == nil {
-			hm.RUnlock()
-			return false
-		}
-		complete := i.HandshakeComplete
-		hm.RUnlock()
-		return complete
+	hm.Hosts[hostinfo.hostId] = hostinfo
+	hm.Indexes[hostinfo.localIndexId] = hostinfo
+	hm.RemoteIndexes[hostinfo.remoteIndexId] = hostinfo
 
+	if hm.l.Level >= logrus.DebugLevel {
+		hm.l.WithField("hostMap", m{"mapName": hm.name, "vpnIp": IntIp(hostinfo.hostId), "mapTotalSize": len(hm.Hosts),
+			"hostinfo": m{"existing": true, "localIndexId": hostinfo.localIndexId, "hostId": IntIp(hostinfo.hostId)}}).
+			Debug("Hostmap vpnIp added")
 	}
-	hm.RUnlock()
-	return false
 }
 
 func (hm *HostMap) ClearRemotes(vpnIP uint32) {
@@ -416,10 +428,11 @@ func (hm *HostMap) Punchy(conn *udpConn) {
 		metricsTxPunchy = metrics.NilCounter{}
 	}
 
+	b := []byte{1}
 	for {
 		for _, addr := range hm.PunchList() {
 			metricsTxPunchy.Inc(1)
-			conn.WriteTo([]byte{1}, addr)
+			conn.WriteTo(b, addr)
 		}
 		time.Sleep(time.Second * 30)
 	}
@@ -427,7 +440,7 @@ func (hm *HostMap) Punchy(conn *udpConn) {
 
 func (hm *HostMap) addUnsafeRoutes(routes *[]route) {
 	for _, r := range *routes {
-		l.WithField("route", r.route).WithField("via", r.via).Warn("Adding UNSAFE Route")
+		hm.l.WithField("route", r.route).WithField("via", r.via).Warn("Adding UNSAFE Route")
 		hm.unsafeRoutes.AddCIDR(r.route, ip2int(*r.via))
 	}
 }
@@ -463,10 +476,9 @@ func (i *HostInfo) TryPromoteBest(preferredRanges []*net.IPNet, ifce *Interface)
 		return
 	}
 
-	i.promoteCounter++
-	if i.promoteCounter%PromoteEvery == 0 {
+	if atomic.AddUint32(&i.promoteCounter, 1)%PromoteEvery == 0 {
 		// return early if we are already on a preferred remote
-		rIP := udp2ip(i.remote)
+		rIP := i.remote.IP
 		for _, l := range preferredRanges {
 			if l.Contains(rIP) {
 				return
@@ -499,7 +511,7 @@ func (i *HostInfo) ForcePromoteBest(preferredRanges []*net.IPNet) {
 func (i *HostInfo) getBestRemote(preferredRanges []*net.IPNet) (best *udpAddr, preferred bool) {
 	if len(i.Remotes) > 0 {
 		for _, r := range i.Remotes {
-			rIP := udp2ip(r.addr)
+			rIP := r.addr.IP
 
 			for _, l := range preferredRanges {
 				if l.Contains(rIP) {
@@ -558,20 +570,22 @@ func (i *HostInfo) rotateRemote() {
 	i.remote = i.Remotes[0].addr
 }
 
-func (i *HostInfo) cachePacket(t NebulaMessageType, st NebulaMessageSubType, packet []byte, f packetCallback) {
+func (i *HostInfo) cachePacket(l *logrus.Logger, t NebulaMessageType, st NebulaMessageSubType, packet []byte, f packetCallback) {
 	//TODO: return the error so we can log with more context
 	if len(i.packetStore) < 100 {
 		tempPacket := make([]byte, len(packet))
 		copy(tempPacket, packet)
 		//l.WithField("trace", string(debug.Stack())).Error("Caching packet", tempPacket)
 		i.packetStore = append(i.packetStore, &cachedPacket{t, st, f, tempPacket})
-		i.logger().
-			WithField("length", len(i.packetStore)).
-			WithField("stored", true).
-			Debugf("Packet store")
+		if l.Level >= logrus.DebugLevel {
+			i.logger(l).
+				WithField("length", len(i.packetStore)).
+				WithField("stored", true).
+				Debugf("Packet store")
+		}
 
 	} else if l.Level >= logrus.DebugLevel {
-		i.logger().
+		i.logger(l).
 			WithField("length", len(i.packetStore)).
 			WithField("stored", false).
 			Debugf("Packet store")
@@ -579,7 +593,7 @@ func (i *HostInfo) cachePacket(t NebulaMessageType, st NebulaMessageSubType, pac
 }
 
 // handshakeComplete will set the connection as ready to communicate, as well as flush any stored packets
-func (i *HostInfo) handshakeComplete() {
+func (i *HostInfo) handshakeComplete(l *logrus.Logger) {
 	//TODO: I'm not certain the distinction between handshake complete and ConnectionState being ready matters because:
 	//TODO: HandshakeComplete means send stored packets and ConnectionState.ready means we are ready to send
 	//TODO: if the transition from HandhsakeComplete to ConnectionState.ready happens all within this function they are identical
@@ -588,13 +602,20 @@ func (i *HostInfo) handshakeComplete() {
 	i.HandshakeComplete = true
 	//TODO: this should be managed by the handshake state machine to set it based on how many handshake were seen.
 	// Clamping it to 2 gets us out of the woods for now
-	*i.ConnectionState.messageCounter = 2
-	i.logger().Debugf("Sending %d stored packets", len(i.packetStore))
-	nb := make([]byte, 12, 12)
-	out := make([]byte, mtu)
-	for _, cp := range i.packetStore {
-		cp.callback(cp.messageType, cp.messageSubType, i, cp.packet, nb, out)
+	atomic.StoreUint64(&i.ConnectionState.atomicMessageCounter, 2)
+
+	if l.Level >= logrus.DebugLevel {
+		i.logger(l).Debugf("Sending %d stored packets", len(i.packetStore))
 	}
+
+	if len(i.packetStore) > 0 {
+		nb := make([]byte, 12, 12)
+		out := make([]byte, mtu)
+		for _, cp := range i.packetStore {
+			cp.callback(cp.messageType, cp.messageSubType, i, cp.packet, nb, out)
+		}
+	}
+
 	i.packetStore = make([]*cachedPacket, 0)
 	i.ConnectionState.ready = true
 	i.ConnectionState.queueLock.Unlock()
@@ -616,8 +637,7 @@ func (i *HostInfo) GetCert() *cert.NebulaCertificate {
 	return nil
 }
 
-func (i *HostInfo) AddRemote(r udpAddr) *udpAddr {
-	remote := &r
+func (i *HostInfo) AddRemote(remote *udpAddr) *udpAddr {
 	//add := true
 	for _, r := range i.Remotes {
 		if r.addr.Equals(remote) {
@@ -629,12 +649,13 @@ func (i *HostInfo) AddRemote(r udpAddr) *udpAddr {
 	if len(i.Remotes) > MaxRemotes {
 		i.Remotes = i.Remotes[len(i.Remotes)-MaxRemotes:]
 	}
-	i.Remotes = append(i.Remotes, NewHostInfoDest(remote))
-	return remote
+	r := NewHostInfoDest(remote)
+	i.Remotes = append(i.Remotes, r)
+	return r.addr
 	//l.Debugf("Added remote %s for vpn ip", remote)
 }
 
-func (i *HostInfo) SetRemote(remote udpAddr) {
+func (i *HostInfo) SetRemote(remote *udpAddr) {
 	i.remote = i.AddRemote(remote)
 }
 
@@ -672,7 +693,7 @@ func (i *HostInfo) CreateRemoteCIDR(c *cert.NebulaCertificate) {
 	i.remoteCidr = remoteCidr
 }
 
-func (i *HostInfo) logger() *logrus.Entry {
+func (i *HostInfo) logger(l *logrus.Logger) *logrus.Entry {
 	if i == nil {
 		return logrus.NewEntry(l)
 	}
@@ -692,7 +713,7 @@ func (i *HostInfo) logger() *logrus.Entry {
 
 func NewHostInfoDest(addr *udpAddr) *HostInfoDest {
 	i := &HostInfoDest{
-		addr: addr,
+		addr: addr.Copy(),
 	}
 	return i
 }
@@ -787,7 +808,7 @@ func (d *HostInfoDest) ProbeReceived(probeCount int) {
 
 // Utility functions
 
-func localIps(allowList *AllowList) *[]net.IP {
+func localIps(l *logrus.Logger, allowList *AllowList) *[]net.IP {
 	//FIXME: This function is pretty garbage
 	var ips []net.IP
 	ifaces, _ := net.Interfaces()
@@ -807,8 +828,11 @@ func localIps(allowList *AllowList) *[]net.IP {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip.To4() != nil && ip.IsLoopback() == false {
-				allow := allowList.Allow(ip2int(ip))
+
+			//TODO: Filtering out link local for now, this is probably the most correct thing
+			//TODO: Would be nice to filter out SLAAC MAC based ips as well
+			if ip.IsLoopback() == false && !ip.IsLinkLocalUnicast() {
+				allow := allowList.Allow(ip)
 				l.WithField("localIp", ip).WithField("allow", allow).Debug("localAllowList.Allow")
 				if !allow {
 					continue
@@ -822,6 +846,7 @@ func localIps(allowList *AllowList) *[]net.IP {
 }
 
 func PrivateIP(ip net.IP) bool {
+	//TODO: Private for ipv6 or just let it ride?
 	private := false
 	_, private24BitBlock, _ := net.ParseCIDR("10.0.0.0/8")
 	_, private20BitBlock, _ := net.ParseCIDR("172.16.0.0/12")

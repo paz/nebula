@@ -17,14 +17,14 @@ const (
 	minFwPacketLen = 4
 )
 
-func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte, header *Header, fwPacket *FirewallPacket, lhh *LightHouseHandler, nb []byte) {
+func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte, header *Header, fwPacket *FirewallPacket, lhh *LightHouseHandler, nb []byte, q int, localCache ConntrackCache) {
 	err := header.Parse(packet)
 	if err != nil {
 		// TODO: best if we return this and let caller log
 		// TODO: Might be better to send the literal []byte("holepunch") packet and ignore that?
 		// Hole punch packets are 0 or 1 byte big, so lets ignore printing those errors
 		if len(packet) > 1 {
-			l.WithField("packet", packet).Infof("Error while parsing inbound packet from %s: %s", addr, err)
+			f.l.WithField("packet", packet).Infof("Error while parsing inbound packet from %s: %s", addr, err)
 		}
 		return
 	}
@@ -45,7 +45,7 @@ func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte,
 			return
 		}
 
-		f.decryptToTun(hostinfo, header.MessageCounter, out, packet, fwPacket, nb)
+		f.decryptToTun(hostinfo, header.MessageCounter, out, packet, fwPacket, nb, q, localCache)
 
 		// Fallthrough to the bottom to record incoming traffic
 
@@ -57,7 +57,7 @@ func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte,
 
 		d, err := f.decrypt(hostinfo, header.MessageCounter, out, packet, header, nb)
 		if err != nil {
-			hostinfo.logger().WithError(err).WithField("udpAddr", addr).
+			hostinfo.logger(f.l).WithError(err).WithField("udpAddr", addr).
 				WithField("packet", packet).
 				Error("Failed to decrypt lighthouse packet")
 
@@ -78,7 +78,7 @@ func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte,
 
 		d, err := f.decrypt(hostinfo, header.MessageCounter, out, packet, header, nb)
 		if err != nil {
-			hostinfo.logger().WithError(err).WithField("udpAddr", addr).
+			hostinfo.logger(f.l).WithError(err).WithField("udpAddr", addr).
 				WithField("packet", packet).
 				Error("Failed to decrypt test packet")
 
@@ -106,7 +106,6 @@ func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte,
 
 	case recvError:
 		f.messageMetrics.Rx(header.Type, header.Subtype, 1)
-		// TODO: Remove this with recv_error deprecation
 		f.handleRecvError(addr, header)
 		return
 
@@ -116,7 +115,7 @@ func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte,
 			return
 		}
 
-		hostinfo.logger().WithField("udpAddr", addr).
+		hostinfo.logger(f.l).WithField("udpAddr", addr).
 			Info("Close tunnel received, tearing down.")
 
 		f.closeTunnel(hostinfo)
@@ -124,7 +123,7 @@ func (f *Interface) readOutsidePackets(addr *udpAddr, out []byte, packet []byte,
 
 	default:
 		f.messageMetrics.Rx(header.Type, header.Subtype, 1)
-		hostinfo.logger().Debugf("Unexpected packet received from %s", addr)
+		hostinfo.logger(f.l).Debugf("Unexpected packet received from %s", addr)
 		return
 	}
 
@@ -143,24 +142,24 @@ func (f *Interface) closeTunnel(hostInfo *HostInfo) {
 
 func (f *Interface) handleHostRoaming(hostinfo *HostInfo, addr *udpAddr) {
 	if hostDidRoam(hostinfo.remote, addr) {
-		if !f.lightHouse.remoteAllowList.Allow(udp2ipInt(addr)) {
-			hostinfo.logger().WithField("newAddr", addr).Debug("lighthouse.remote_allow_list denied roaming")
+		if !f.lightHouse.remoteAllowList.Allow(addr.IP) {
+			hostinfo.logger(f.l).WithField("newAddr", addr).Debug("lighthouse.remote_allow_list denied roaming")
 			return
 		}
-		if !hostinfo.lastRoam.IsZero() && addr.Equals(hostinfo.lastRoamRemote) && time.Since(hostinfo.lastRoam) < RoamingSupressSeconds*time.Second {
-			if l.Level >= logrus.DebugLevel {
-				hostinfo.logger().WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
-					Debugf("Supressing roam back to previous remote for %d seconds", RoamingSupressSeconds)
+		if !hostinfo.lastRoam.IsZero() && addr.Equals(hostinfo.lastRoamRemote) && time.Since(hostinfo.lastRoam) < RoamingSuppressSeconds*time.Second {
+			if f.l.Level >= logrus.DebugLevel {
+				hostinfo.logger(f.l).WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
+					Debugf("Suppressing roam back to previous remote for %d seconds", RoamingSuppressSeconds)
 			}
 			return
 		}
 
-		hostinfo.logger().WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
+		hostinfo.logger(f.l).WithField("udpAddr", hostinfo.remote).WithField("newAddr", addr).
 			Info("Host roamed to new udp ip/port.")
 		hostinfo.lastRoam = time.Now()
 		remoteCopy := *hostinfo.remote
 		hostinfo.lastRoamRemote = &remoteCopy
-		hostinfo.SetRemote(*addr)
+		hostinfo.SetRemote(addr)
 		if f.lightHouse.amLighthouse {
 			f.lightHouse.AddRemote(hostinfo.hostId, addr, false)
 		}
@@ -171,7 +170,7 @@ func (f *Interface) handleHostRoaming(hostinfo *HostInfo, addr *udpAddr) {
 func (f *Interface) handleEncrypted(ci *ConnectionState, addr *udpAddr, header *Header) bool {
 	// If connectionstate exists and the replay protector allows, process packet
 	// Else, send recv errors for 300 seconds after a restart to allow fast reconnection.
-	if ci == nil || !ci.window.Check(header.MessageCounter) {
+	if ci == nil || !ci.window.Check(f.l, header.MessageCounter) {
 		f.sendRecvError(addr, header.RemoteIndex)
 		return false
 	}
@@ -248,8 +247,8 @@ func (f *Interface) decrypt(hostinfo *HostInfo, mc uint64, out []byte, packet []
 		return nil, err
 	}
 
-	if !hostinfo.ConnectionState.window.Update(mc) {
-		hostinfo.logger().WithField("header", header).
+	if !hostinfo.ConnectionState.window.Update(f.l, mc) {
+		hostinfo.logger(f.l).WithField("header", header).
 			Debugln("dropping out of window packet")
 		return nil, errors.New("out of window packet")
 	}
@@ -257,12 +256,12 @@ func (f *Interface) decrypt(hostinfo *HostInfo, mc uint64, out []byte, packet []
 	return out, nil
 }
 
-func (f *Interface) decryptToTun(hostinfo *HostInfo, messageCounter uint64, out []byte, packet []byte, fwPacket *FirewallPacket, nb []byte) {
+func (f *Interface) decryptToTun(hostinfo *HostInfo, messageCounter uint64, out []byte, packet []byte, fwPacket *FirewallPacket, nb []byte, q int, localCache ConntrackCache) {
 	var err error
 
 	out, err = hostinfo.ConnectionState.dKey.DecryptDanger(out, packet[:HeaderLen], packet[HeaderLen:], messageCounter, nb)
 	if err != nil {
-		hostinfo.logger().WithError(err).Error("Failed to decrypt packet")
+		hostinfo.logger(f.l).WithError(err).Error("Failed to decrypt packet")
 		//TODO: maybe after build 64 is out? 06/14/2018 - NB
 		//f.sendRecvError(hostinfo.remote, header.RemoteIndex)
 		return
@@ -270,21 +269,21 @@ func (f *Interface) decryptToTun(hostinfo *HostInfo, messageCounter uint64, out 
 
 	err = newPacket(out, true, fwPacket)
 	if err != nil {
-		hostinfo.logger().WithError(err).WithField("packet", out).
+		hostinfo.logger(f.l).WithError(err).WithField("packet", out).
 			Warnf("Error while validating inbound packet")
 		return
 	}
 
-	if !hostinfo.ConnectionState.window.Update(messageCounter) {
-		hostinfo.logger().WithField("fwPacket", fwPacket).
+	if !hostinfo.ConnectionState.window.Update(f.l, messageCounter) {
+		hostinfo.logger(f.l).WithField("fwPacket", fwPacket).
 			Debugln("dropping out of window packet")
 		return
 	}
 
-	dropReason := f.firewall.Drop(out, *fwPacket, true, hostinfo, trustedCAs)
+	dropReason := f.firewall.Drop(out, *fwPacket, true, hostinfo, trustedCAs, localCache)
 	if dropReason != nil {
-		if l.Level >= logrus.DebugLevel {
-			hostinfo.logger().WithField("fwPacket", fwPacket).
+		if f.l.Level >= logrus.DebugLevel {
+			hostinfo.logger(f.l).WithField("fwPacket", fwPacket).
 				WithField("reason", dropReason).
 				Debugln("dropping inbound packet")
 		}
@@ -292,9 +291,9 @@ func (f *Interface) decryptToTun(hostinfo *HostInfo, messageCounter uint64, out 
 	}
 
 	f.connectionManager.In(hostinfo.hostId)
-	err = f.inside.WriteRaw(out)
+	_, err = f.readers[q].Write(out)
 	if err != nil {
-		l.WithError(err).Error("Failed to write to tun")
+		f.l.WithError(err).Error("Failed to write to tun")
 	}
 }
 
@@ -304,33 +303,37 @@ func (f *Interface) sendRecvError(endpoint *udpAddr, index uint32) {
 	//TODO: this should be a signed message so we can trust that we should drop the index
 	b := HeaderEncode(make([]byte, HeaderLen), Version, uint8(recvError), 0, index, 0)
 	f.outside.WriteTo(b, endpoint)
-	if l.Level >= logrus.DebugLevel {
-		l.WithField("index", index).
+	if f.l.Level >= logrus.DebugLevel {
+		f.l.WithField("index", index).
 			WithField("udpAddr", endpoint).
 			Debug("Recv error sent")
 	}
 }
 
 func (f *Interface) handleRecvError(addr *udpAddr, h *Header) {
-	// This flag is to stop caring about recv_error from old versions
-	// This should go away when the old version is gone from prod
-	if l.Level >= logrus.DebugLevel {
-		l.WithField("index", h.RemoteIndex).
+	if f.l.Level >= logrus.DebugLevel {
+		f.l.WithField("index", h.RemoteIndex).
 			WithField("udpAddr", addr).
 			Debug("Recv error received")
 	}
 
+	// First, clean up in the pending hostmap
+	f.handshakeManager.pendingHostMap.DeleteReverseIndex(h.RemoteIndex)
+
 	hostinfo, err := f.hostMap.QueryReverseIndex(h.RemoteIndex)
 	if err != nil {
-		l.Debugln(err, ": ", h.RemoteIndex)
+		f.l.Debugln(err, ": ", h.RemoteIndex)
 		return
 	}
+
+	hostinfo.Lock()
+	defer hostinfo.Unlock()
 
 	if !hostinfo.RecvErrorExceeded() {
 		return
 	}
 	if hostinfo.remote != nil && hostinfo.remote.String() != addr.String() {
-		l.Infoln("Someone spoofing recv_errors? ", addr, hostinfo.remote)
+		f.l.Infoln("Someone spoofing recv_errors? ", addr, hostinfo.remote)
 		return
 	}
 
